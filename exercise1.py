@@ -200,54 +200,49 @@ print(v)
 print("controls:")
 print(a)
 
-def simulate_lqr_cost_explicit(
-    lqr,
-    x0,
-    t0=0.0,
-    N=100,
-    n_paths=10000,
-    seed=1234
-):
-    """
-    Simulate the optimally controlled SDE using explicit Euler.
-
-    Returns:
-        mc_mean_cost, mc_std_cost
-    """
+def simulate_lqr_cost_explicit(lqr, x0, t0=0.0, N=100, n_paths=10000, seed=1234):
     rng = np.random.default_rng(seed)
-
     dt = (lqr.T - t0) / N
     time_grid = np.linspace(t0, lqr.T, N + 1)
 
-    x0 = np.asarray(x0, dtype=float)
-    X = np.tile(x0, (n_paths, 1))   # shape (n_paths, 2)
-
+    X = np.tile(x0, (n_paths, 1)).astype(float) # shape (n_paths, 2)
     running_cost = np.zeros(n_paths)
-
     sqrt_dt = np.sqrt(dt)
 
+    # Pre-compute some constant matrices
+    M_T = lqr.M.T
+    H_T = lqr.H.T
+    sigma_T = lqr.sigma.T
+
     for n in range(N):
-        t_n = np.full(n_paths, time_grid[n], dtype=float)
+        t_n = time_grid[n]
+        
+        # 1. Evaluate S(t_n) just ONCE per time step (since all paths share the same time)
+        # We manually call the interpolation logic for a single scalar time
+        S_tn, _ = lqr._interp_S_and_g(np.array([t_n]))
+        S_tn = S_tn[0] # The 2x2 matrix for time t_n
 
-        # control a(t_n, X_n)
-        t_torch = torch.tensor(t_n, dtype=torch.float32)
-        x_torch = torch.tensor(X.reshape(n_paths, 1, 2), dtype=torch.float32)
+        # 2. Vectorized Markov Control computation for all paths simultaneously
+        # a(t,x) = -D_inv @ M.T @ S(t) @ x
+        # Let K = -D_inv @ M.T @ S_tn. K is (2, 2). X is (n_paths, 2).
+        K = -lqr.D_inv @ M_T @ S_tn
+        a = (K @ X.T).T # Shape: (n_paths, 2)
 
-        a = lqr.markov_control(t_torch, x_torch).detach().cpu().numpy()  # (n_paths, 2)
-
-        # running cost approximation
-        xCx = np.einsum("bi,ij,bj->b", X, lqr.C, X)
-        aDa = np.einsum("bi,ij,bj->b", a, lqr.D, a)
+        # 3. Vectorized Running Cost approximation
+        # Equivalent to diag(X @ C @ X.T) and diag(a @ D @ a.T) but much faster
+        xCx = np.sum(X * (X @ lqr.C), axis=1) 
+        aDa = np.sum(a * (a @ lqr.D), axis=1)
         running_cost += (xCx + aDa) * dt
 
-        # Euler step
+        # 4. Vectorized Euler step
         dW = rng.normal(size=(n_paths, 2)) * sqrt_dt
-        drift = (X @ lqr.H.T) + (a @ lqr.M.T)
-        diffusion = dW @ lqr.sigma.T
+        drift = (X @ H_T) + (a @ M_T)
+        diffusion = dW @ sigma_T
 
         X = X + drift * dt + diffusion
 
-    terminal_cost = np.einsum("bi,ij,bj->b", X, lqr.R, X)
+    # Terminal cost
+    terminal_cost = np.sum(X * (X @ lqr.R), axis=1)
     total_cost = running_cost + terminal_cost
 
     return total_cost.mean(), total_cost.std(ddof=1)
